@@ -21,16 +21,21 @@
 // -----------------------------------------------------------------------------
 
 using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+using WikiPeopleCounter.Models;
 
 namespace WikiPeopleCounter.Data;
 
-public class CategoriesSearched {
-    public CategoriesSearched(string title) {
-        Title = title;
-    }
-    
+public class Category(string title) {
     [Key] 
     public uint CategoryId { get; set; }
     
-    public string Title { get; set; }
+    public string Title { get; set; } = title;
+    
+    public string? LastSortKey { get; set; }
+    
+    public bool Finished { get; set; } = false;
+    
+    [InverseProperty(nameof(Page.PulledFrom))]
+    public List<Page> Pages { get; set; } = new ();
 }

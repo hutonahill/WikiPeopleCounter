@@ -1,4 +1,5 @@
 ﻿using System.Diagnostics;
+using System.Reflection;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.EntityFrameworkCore;
@@ -13,7 +14,7 @@ class Program {
         "Category:Living people"
     };
     
-    public static readonly KeyValuePair<string, string> DefaultHeader = new ("User-Agent", "WikiPeopleCrawler/1.0");
+    public const string UserAgentString = "WikiPeopleCounter/0.1 (https://github.com/hutonahill/WikiPeopleCounter)";
     
     private static ProgressBar? _bar;
     
@@ -21,12 +22,14 @@ class Program {
         SetUp();
         
         foreach (string category in _categoriesToSearch) {
-            if (await FetchCategoryPagesAsync(category)) {
-                await using (PageDataContext ctx = new ()) {
-                    ctx.CategoriesSearched.Add(new CategoriesSearched(category));
-                    await ctx.SaveChangesAsync();
-                }
+            string? lastSortKey;
+            using (PageDataContext ctx = new ()) {
+                lastSortKey = ctx.Categories
+                   .FirstOrDefault(c => c.Title == category)?
+                   .LastSortKey;
             }
+            
+            await FetchCategoryPagesAsync(category, lastSortKey);
         }
         
         /*int count = -1;
@@ -79,13 +82,19 @@ class Program {
         // Ensure database and tables exist
         context.Database.EnsureCreated();
         
+        foreach (string catigory in CategoriesToSearch) {
+            if (!context.Categories.Any(c => c.Title == catigory)) {
+                context.Categories.Add(new Category(catigory));
+            }
+        }
+        
         int totalPages = context.Pages.Count();
         int processedPages = context.Pages.Count(p => p.Processed);
-        int totalCategories = context.CategoriesSearched.Count();
+        int searchedCatigoryCount = context.Categories.Count(c => c.Finished);
         
         if (totalPages == 0) {
             Console.WriteLine("Database is empty. Ready to start fetching pages.");
-            _categoriesToSearch = CategoriesToSearch;
+            _categoriesToSearch = context.Categories.Select(c => c.Title).ToList();
         }
         else {
             // DB is not empty
@@ -94,20 +103,21 @@ class Program {
                 context.SaveChanges();
                 Console.WriteLine("Database wiped. Ready to start fresh.");
                 _categoriesToSearch = CategoriesToSearch;
+                context.Categories.ForEachAsync(c => c.Finished = false);
             }
             else {
                 if (processedPages == 0) {
                     Console.WriteLine("Database has pages, but none have been processed.");
                     
                     if (Question("Do you want to search for more pages?")) {
-                        if (totalCategories > 0 && Question("Some categories have already been fully searched. Do you want to re-search them?")) {
-                            _categoriesToSearch = CategoriesToSearch;
+                        if (searchedCatigoryCount > 0 && Question("Some categories have already been fully searched. Do you want to re-search them?")) {
+                            _categoriesToSearch = context.Categories.Select(c => c.Title).ToList();
                         }
                         else {
-                            _categoriesToSearch = CategoriesToSearch
-                               .Where(c => !context.CategoriesSearched
-                                   .Any(cat => cat.Title == c)
-                               ).ToList();
+                            _categoriesToSearch = context.Categories
+                               .Where(c => c.Finished == false)
+                               .Select(c => c.Title)
+                               .ToList();
                         }
                     }
                     else {
@@ -128,142 +138,119 @@ class Program {
     
     private static int i = 1;
     
-    private static async Task<bool> FetchCategoryPagesAsync(string category) {
-        const int batchSize = 5000; // I think this is media-wiki's max.
-        const double delayMS = 800;
-
-        using HttpClient client = new ();
-        client.DefaultRequestHeaders.Add(DefaultHeader.Key, DefaultHeader.Value);
-
+    private static async Task<bool> FetchCategoryPagesAsync(string category, string? startingSortKey = null) {
         string cmcontinue = string.Empty;
-        
-        await using PageDataContext context = new ();
-        
-        string url = $"https://en.wikipedia.org/w/api.php";
-        
+        int batchIndex = 1;
+
+        await using PageDataContext context = new();
+
+        Category target = context.Categories.FirstOrDefault(c => c.Title == category) ??
+                          throw new InvalidOperationException("Cannot search for a non-existent category");
+    
         while (true) {
             Dictionary<string, string> parameters = new() {
                 { "action", "query" },
                 { "format", "json" },
-                { "list", "categorymembers" },          // ← switch to list
+                { "list", "categorymembers" },
                 { "cmtitle", category },
                 { "cmtype", "page" },
-                { "cmlimit", batchSize.ToString() }
+                { "cmlimit", "max" },
+                { "cmsort", "sortkey" },
+                { "cmprop", "title|ids|sortkey" }
             };
-            
-            if (!string.IsNullOrEmpty(cmcontinue)){
+
+            if (!string.IsNullOrEmpty(cmcontinue)) {
                 parameters["cmcontinue"] = cmcontinue;
             }
-                
-
-            // Build query string
-            string query = string.Join("&", parameters.Select(kvp => $"{kvp.Key}={Uri.EscapeDataString(kvp.Value)}"));
-            string requestUrl = $"{url}?{query}";
-
-            HttpResponseMessage response;
-            try {
-                response = await client.GetAsync(requestUrl);
-            }
-            catch (HttpRequestException ex) {
-                Console.WriteLine($"Network error fetching category '{category}': {ex.Message}");
-                return false;
-            }
-            
-            _lastQueryTime = DateTime.Now;
-            
-
-            if (!response.IsSuccessStatusCode) {
-                Console.WriteLine($"HTTP error {response.StatusCode} fetching category '{category}'.");
-                return false;
+            else if (!string.IsNullOrEmpty(startingSortKey)) {
+                parameters["cmstarthexsortkey"] = startingSortKey;
             }
 
-            string rawJson = await response.Content.ReadAsStringAsync();
-
-            JsonDocument doc;
-            try {
-                doc = JsonDocument.Parse(rawJson);
-            }
-            catch (JsonException ex) {
-                Console.WriteLine($"JSON parse error fetching category '{category}': {ex.Message}");
-                return false;
-            }
-
+            using JsonDocument doc = await QueryWikipediaApiAsync(parameters);
             JsonElement root = doc.RootElement;
 
-            if (!root.TryGetProperty("query", out JsonElement queryElement) || 
-                !queryElement.TryGetProperty("categorymembers", out JsonElement pagesElement))
+            if (!root.TryGetProperty("query", out JsonElement queryElement) ||
+                !queryElement.TryGetProperty("categorymembers", out JsonElement pagesElement)) 
             {
                 Console.WriteLine($"No pages found in category '{category}' or unexpected response structure.");
-                doc.Dispose();
                 return false;
             }
 
             int addedCount = 0;
-            
-            HashSet<Page> newPages = new ();
-            
+            HashSet<Page> newPages = new();
+
             foreach (JsonElement page in pagesElement.EnumerateArray()) {
-                string title = page.GetProperty("title").GetString() ??
-                               throw new InvalidDataException("Expected a title property.");
+                string title = page.GetProperty("title").GetString() 
+                               ?? throw new InvalidDataException("Expected a title property.");
                 
-                // Generate Name by removing " (<anyText>)" from the end
+                // name removed disambiguation data.
                 string name = Regex.Replace(title, @"\s*\(.*?\)$", "");
+                
                 
                 string wikiId = page.TryGetProperty("pageid", out JsonElement idProp)
                     ? idProp.GetInt32().ToString()
                     : throw new InvalidDataException("Expected a pageid property.");
+
+                string sortKey = page.TryGetProperty("sortkey", out JsonElement sortKeyProp)
+                    ? sortKeyProp.GetString() ?? throw new InvalidDataException("Expected a sortkey property.")
+                    : throw new InvalidDataException("Expected a sortkey property.");
                 
-                // Avoid duplicates by Title or Name
-               if (await context.Pages.AnyAsync(p => p.Title == title || p.Name == name || p.WikiPageId == wikiId)) {
+                // check pages added in the current batch.
+                if (newPages.Any(p => p.Title == title || p.Name == name || p.WikiPageId == wikiId)) {
                     continue;
-               }
-               
-               if (newPages.Any(p => p.Title == title || p.Name == name || p.WikiPageId == wikiId)) {
-                   continue;
-               }
+                }
                 
+                // then check the database.
+                if (await context.Pages.AnyAsync(p => p.Title == title || p.Name == name || p.WikiPageId == wikiId)) {
+                    continue;
+                }
+                
+                // assuming both tests pass, we add the new page.
                 Page newPage = new() {
                     Title = title,
                     Name = name,
-                    WikiPageId = wikiId
+                    WikiPageId = wikiId,
+                    SortKey = sortKey,
+                    PulledFrom = target
                 };
-                
+
                 newPages.Add(newPage);
                 addedCount++;
+                
+                // once a batch is done we update the last seen sortkey in the database.
+                // This will prevent us from needing to walk the whole db again in the case of a crash.
+                // We only call saveChanges once per batch, so we don't need to worry about updates.
+                target.LastSortKey = newPage.SortKey;
             }
-            
-            
+
             if (newPages.Any()) {
                 await context.Pages.AddRangeAsync(newPages);
-                            
+                
+                
+
                 await context.SaveChangesAsync();
             }
-            Console.WriteLine($"Fetched {addedCount:N0} new pages from batch #{i:N0}. (total {context.Pages.Count():N0})");
-            i++;
 
-            // Check for continuation
-            if(root.TryGetProperty("continue", out JsonElement cont)){
-                if(cont.TryGetProperty("cmcontinue", out JsonElement contVal)){
-                    cmcontinue = contVal.GetString() ?? String.Empty;
-                }
-                else{
-                    cmcontinue = String.Empty; // done
-                }
+            Console.WriteLine($"Fetched {addedCount:N0} new pages from batch #{batchIndex:N0}. Total in DB: {context.Pages.Count():N0}");
+            batchIndex++;
+
+            // Check if we are done
+            if (
+                root.TryGetProperty("continue", out JsonElement cont) &&
+                cont.TryGetProperty("cmcontinue", out JsonElement contVal) &&
+                !string.IsNullOrEmpty(contVal.GetString())
+            ) {
+                cmcontinue = contVal.GetString()!;
             }
-            
-            doc.Dispose();
-            
-            // Maintain the minimum amount of time between queries
-            TimeSpan actualDelay = (_lastQueryTime + TimeSpan.FromMilliseconds(delayMS)) - DateTime.Now;
-            
-            if (actualDelay < TimeSpan.Zero) {
-                actualDelay = TimeSpan.Zero;
+            else {
+                // No more continuation → mark category as finished
+                target.Finished = true;
+                await context.SaveChangesAsync();
+                Console.WriteLine($"Category '{category}' fully fetched.");
+                break;
             }
-            
-            await Task.Delay(actualDelay);
         }
 
-        Console.WriteLine($"Completed fetching all pages from category '{category}'.");
         return true;
     }
     
@@ -277,7 +264,7 @@ class Program {
         DateTime startDate = endDate - pageviewsPeriod;
         Dictionary<string, int> results = new();
 
-        ProgressBarOptions options = new ProgressBarOptions { ForegroundColor = ConsoleColor.Cyan };
+        ProgressBarOptions options = new() { ForegroundColor = ConsoleColor.Cyan };
         
         IEnumerable<string> enumerable = titles.ToList();
         
@@ -321,11 +308,7 @@ class Program {
         return results;
     }
 
-    private static async Task<Dictionary<string, int>> GetBacklinksBatchAsync(
-        HttpClient client,
-        List<string> titles,
-        int delayMilliseconds)
-    {
+    private static async Task<Dictionary<string, int>> GetBacklinksBatchAsync(List<string> titles) {
         Dictionary<string, int> results = new ();
         string lhContinue = string.Empty;
 
@@ -339,7 +322,6 @@ class Program {
         do {
             Dictionary<string, string> parameters = new () {
                 { "action", "query" },
-                { "format", "json" },
                 { "prop", "linkshere" },
                 { "titles", joinedTitles },
                 { "lhlimit", "max" }
@@ -348,59 +330,30 @@ class Program {
             if (!string.IsNullOrEmpty(lhContinue)) {
                 parameters["lhcontinue"] = lhContinue;
             }
-
-            string query = string.Join("&", parameters.Select(kvp =>
-                kvp.Key + "=" + Uri.EscapeDataString(kvp.Value)));
-
-            string url = "https://en.wikipedia.org/w/api.php?" + query;
-
-            TimeSpan remainingDelay =
-                _lastQueryTime + TimeSpan.FromMilliseconds(delayMilliseconds) - DateTime.Now;
-
-            if (remainingDelay > TimeSpan.Zero) {
-                await Task.Delay(remainingDelay);
-            }
-
-            try {
-                HttpResponseMessage response = await client.GetAsync(url);
-                _lastQueryTime = DateTime.Now;
-
-                if (response.IsSuccessStatusCode) {
-                    string raw = await response.Content.ReadAsStringAsync();
-                    using JsonDocument doc = JsonDocument.Parse(raw);
-
-                    if (doc.RootElement.TryGetProperty("query", out JsonElement queryEl) &&
-                        queryEl.TryGetProperty("pages", out JsonElement pages))
-                    {
-                        foreach (JsonProperty pageProp in pages.EnumerateObject()) {
-                            JsonElement page = pageProp.Value;
-
-                            if (page.TryGetProperty("title", out JsonElement titleEl) &&
-                                page.TryGetProperty("linkshere", out JsonElement links))
-                            {
-                                string pageTitle = titleEl.GetString() ?? string.Empty;
-                                results[pageTitle] += links.GetArrayLength();
-                            }
-                        }
-                    }
-
-                    if (doc.RootElement.TryGetProperty("continue", out JsonElement cont) &&
-                        cont.TryGetProperty("lhcontinue", out JsonElement contVal))
-                    {
-                        lhContinue = contVal.GetString() ?? string.Empty;
-                    }
-                    else {
-                        lhContinue = string.Empty;
+            
+            using JsonDocument doc = await QueryWikipediaApiAsync(parameters);
+            
+            if (doc.RootElement.TryGetProperty("query", out JsonElement queryEl) &&
+                queryEl.TryGetProperty("pages", out JsonElement pages)) {
+                foreach (JsonProperty pageProp in pages.EnumerateObject()) {
+                    JsonElement page = pageProp.Value;
+                    
+                    if (page.TryGetProperty("title", out JsonElement titleEl) &&
+                        page.TryGetProperty("linkshere", out JsonElement links)) {
+                        string pageTitle = titleEl.GetString() ?? string.Empty;
+                        results[pageTitle] += links.GetArrayLength();
                     }
                 }
-                else {
-                    lhContinue = string.Empty;
-                }
             }
-            catch (Exception ex) {
-                Console.WriteLine("Error fetching backlinks batch: " + ex.Message);
+            
+            if (doc.RootElement.TryGetProperty("continue", out JsonElement cont) &&
+                cont.TryGetProperty("lhcontinue", out JsonElement contVal)) {
+                lhContinue = contVal.GetString() ?? string.Empty;
+            }
+            else {
                 lhContinue = string.Empty;
             }
+            
 
         } while (!string.IsNullOrEmpty(lhContinue));
 
@@ -408,10 +361,8 @@ class Program {
     }
 
     private static async Task<Dictionary<string, (string? Url, int? Length, int? Translations)>> GetPageInfoBatchAsync(
-            HttpClient client,
-            List<string> titles,
-            int delayMilliseconds)
-    {
+        List<string> titles
+    ) {
         Dictionary<string, (string? Url, int? Length, int? Translations)> results = new ();
 
         foreach (string title in titles) {
@@ -422,7 +373,7 @@ class Program {
         string joinedTitles = string.Join("|", titles.Select(t => t.Replace(" ", "_")));
 
         do {
-            Dictionary<string, string> parameters = new Dictionary<string, string>() {
+            Dictionary<string, string> parameters = new () {
                 { "action", "query" },
                 { "format", "json" },
                 { "titles", joinedTitles },
@@ -435,83 +386,58 @@ class Program {
                 parameters["llcontinue"] = llContinue;
             }
 
-            string query = string.Join("&", parameters.Select(kvp =>
-                kvp.Key + "=" + Uri.EscapeDataString(kvp.Value)));
+            using JsonDocument doc = await QueryWikipediaApiAsync(parameters);
 
-            string url = "https://en.wikipedia.org/w/api.php?" + query;
+            if (doc.RootElement.TryGetProperty("query", out JsonElement queryEl) &&
+                queryEl.TryGetProperty("pages", out JsonElement pagesEl))
+            {
+                foreach (JsonProperty pageProp in pagesEl.EnumerateObject()) {
+                    JsonElement page = pageProp.Value;
 
-            TimeSpan remainingDelay =
-                _lastQueryTime + TimeSpan.FromMilliseconds(delayMilliseconds) - DateTime.Now;
+                    string pageTitle =
+                        page.TryGetProperty("title", out JsonElement titleProp)
+                            ? titleProp.GetString() ?? string.Empty
+                            : string.Empty;
 
-            if (remainingDelay > TimeSpan.Zero) {
-                await Task.Delay(remainingDelay);
-            }
+                    string? fullUrl =
+                        page.TryGetProperty("fullurl", out JsonElement urlProp)
+                            ? urlProp.GetString()
+                            : null;
 
-            try {
-                HttpResponseMessage response = await client.GetAsync(url);
-                _lastQueryTime = DateTime.Now;
+                    int? length =
+                        page.TryGetProperty("length", out JsonElement lenProp)
+                            ? lenProp.GetInt32()
+                            : null;
 
-                if (response.IsSuccessStatusCode) {
-                    string raw = await response.Content.ReadAsStringAsync();
-                    using JsonDocument doc = JsonDocument.Parse(raw);
+                    int translationsToAdd = 0;
 
-                    if (doc.RootElement.TryGetProperty("query", out JsonElement queryEl) &&
-                        queryEl.TryGetProperty("pages", out JsonElement pagesEl))
-                    {
-                        foreach (JsonProperty pageProp in pagesEl.EnumerateObject()) {
-                            JsonElement page = pageProp.Value;
-
-                            string pageTitle =
-                                page.TryGetProperty("title", out JsonElement titleProp)
-                                    ? titleProp.GetString() ?? string.Empty
-                                    : string.Empty;
-
-                            string? fullUrl =
-                                page.TryGetProperty("fullurl", out JsonElement urlProp)
-                                    ? urlProp.GetString()
-                                    : null;
-
-                            int? length =
-                                page.TryGetProperty("length", out JsonElement lenProp)
-                                    ? lenProp.GetInt32()
-                                    : null;
-
-                            int translationsToAdd = 0;
-
-                            if (page.TryGetProperty("langlinks", out JsonElement langProp)) {
-                                translationsToAdd = langProp.GetArrayLength();
-                            }
-
-                            if (results.ContainsKey(pageTitle)) {
-                                (string? existingUrl, int? existingLength, int? existingTranslations) =
-                                    results[pageTitle];
-
-                                int totalTranslations =
-                                    (existingTranslations ?? 0) + translationsToAdd;
-
-                                results[pageTitle] =
-                                    (fullUrl ?? existingUrl, length ?? existingLength, totalTranslations);
-                            }
-                        }
+                    if (page.TryGetProperty("langlinks", out JsonElement langProp)) {
+                        translationsToAdd = langProp.GetArrayLength();
                     }
 
-                    if (doc.RootElement.TryGetProperty("continue", out JsonElement cont) &&
-                        cont.TryGetProperty("llcontinue", out JsonElement contVal))
-                    {
-                        llContinue = contVal.GetString() ?? string.Empty;
-                    }
-                    else {
-                        llContinue = string.Empty;
+                    if (results.ContainsKey(pageTitle)) {
+                        (string? existingUrl, int? existingLength, int? existingTranslations) =
+                            results[pageTitle];
+
+                        int totalTranslations =
+                            (existingTranslations ?? 0) + translationsToAdd;
+
+                        results[pageTitle] =
+                            (fullUrl ?? existingUrl, length ?? existingLength, totalTranslations);
                     }
                 }
-                else {
-                    llContinue = string.Empty;
-                }
             }
-            catch (Exception ex) {
-                Console.WriteLine("Error fetching page info batch: " + ex.Message);
+
+            if (doc.RootElement.TryGetProperty("continue", out JsonElement cont) &&
+                cont.TryGetProperty("llcontinue", out JsonElement contVal))
+            {
+                llContinue = contVal.GetString() ?? string.Empty;
+            }
+            else {
                 llContinue = string.Empty;
             }
+            
+            
 
         } while (!string.IsNullOrEmpty(llContinue));
 
@@ -523,8 +449,6 @@ class Program {
         int batchSize = 500,
         int delayMilliseconds = 500)
     {
-        using HttpClient client = new();
-        client.DefaultRequestHeaders.Add(DefaultHeader.Key, DefaultHeader.Value);
 
         await using PageDataContext context = new();
 
@@ -543,9 +467,9 @@ class Program {
            .ToList();
         
         //Dictionary<string, int> pageViews = await GetPageViewsBatchAsync(client, titleList, pageviewsPeriod, delayMilliseconds);
-        Dictionary<string, int> backlinks = await GetBacklinksBatchAsync(client, titleList, delayMilliseconds);
+        Dictionary<string, int> backlinks = await GetBacklinksBatchAsync(titleList);
         Dictionary<string, (string? Url, int? Length, int? Translations)> pageInfo = 
-            await GetPageInfoBatchAsync(client, titleList, delayMilliseconds);
+            await GetPageInfoBatchAsync(titleList);
 
         foreach (Page page in pagesToProcess) {
             //page.Views = pageViews[page.Title];
@@ -566,7 +490,6 @@ class Program {
                 page.Translations = translations.Value;
             }
             
-            page.Processed = true;
             page.LastUpdated = DateTime.Now;
             
             await context.SaveChangesAsync();
@@ -576,7 +499,105 @@ class Program {
         return await context.Pages.AnyAsync(p => !p.Processed);
     }
     
-    private static void Log(string message) {
+    private static readonly HttpClient _client = new ();
+    private static int _minimumQueryDelayMilliseconds = 700;
+    
+    private static async Task<JsonDocument> QueryWikipediaApiAsync(
+        Dictionary<string, string> parameters)
+    {
+        const string baseUrl = "https://en.wikipedia.org/w/api.php";
+        const int maxRetries = 10;
         
+
+        // Ensure required parameters
+        parameters.TryAdd("format", "json");
+        
+        const string maxlagString = "maxlag";
+        const int maxLagTime = 5;
+        
+        int timeoutDelay = 10000;
+        
+        parameters.TryAdd(maxlagString, maxLagTime.ToString());
+
+        // Ensure User-Agent exists
+        if (!_client.DefaultRequestHeaders.UserAgent.Any()) {
+            _client.DefaultRequestHeaders.UserAgent.ParseAdd(UserAgentString);
+        }
+
+        int attempt = 0;
+        
+        while (attempt < maxRetries) {
+            attempt++;
+
+            
+            // Enforce minimum delay between requests
+            TimeSpan wait =
+                (_lastQueryTime + TimeSpan.FromMilliseconds(_minimumQueryDelayMilliseconds))
+                - DateTime.UtcNow;
+
+            if (wait > TimeSpan.Zero) {
+                await Task.Delay(wait);
+            }
+
+            string query = string.Join("&",
+                parameters.Select(kvp =>
+                    kvp.Key + "=" + Uri.EscapeDataString(kvp.Value)));
+
+            string url = baseUrl + "?" + query;
+            
+            try {
+                HttpResponseMessage response = await _client.GetAsync(url);
+                _lastQueryTime = DateTime.UtcNow;
+
+                // Detect HTTP rate limiting
+                if ((int)response.StatusCode == 429 ||
+                    response.StatusCode == System.Net.HttpStatusCode.ServiceUnavailable)
+                {
+                    Console.WriteLine($"Wikipedia rate limiting detected. Incrementing minimum wait time by 0.1 second and waiting {timeoutDelay/1000f:N1} seconds...");
+                    _minimumQueryDelayMilliseconds += 100;
+                    await Task.Delay(timeoutDelay);
+                    timeoutDelay += timeoutDelay;
+                }
+                else if (!response.IsSuccessStatusCode) {
+                    throw new Exception("Wikipedia returned HTTP " + response.StatusCode);
+                }
+                else {
+                    string raw = await response.Content.ReadAsStringAsync();
+                    JsonDocument doc = JsonDocument.Parse(raw);
+
+                    // Detect maxlag error
+                    if (doc.RootElement.TryGetProperty("error", out JsonElement errorElement)) {
+                        if (errorElement.TryGetProperty("code", out JsonElement codeElement)) {
+                            string? code = codeElement.GetString();
+
+                            if (code == maxlagString) {
+                                int waitMS = maxLagTime;
+
+                                if (errorElement.TryGetProperty("lag", out JsonElement lagElement)) {
+                                    waitMS = (lagElement.GetInt32()*1000) + 100;
+                                }
+
+                                Console.WriteLine($"Wikipedia maxlag hit. Waiting {(waitMS/1000)} seconds...");
+
+                                await Task.Delay(waitMS);
+                            }
+                            else {
+                                Console.WriteLine("Wikipedia API error: " + code);
+                                return doc;
+                            }
+                        }
+                    }
+                    else {
+                        return doc;
+                    }
+                }
+            }
+            catch (Exception ex) {
+                Console.WriteLine("Wikipedia request exception: " + ex.Message);
+                await Task.Delay(2000);
+            }
+        }
+        
+        throw new Exception($"Wikipedia request failed after the maximum number of retries ({maxRetries}).");
     }
 }

@@ -23,6 +23,7 @@
 using System.ComponentModel.DataAnnotations;
 using System.ComponentModel.DataAnnotations.Schema;
 using System.Diagnostics;
+using WikiPeopleCounter.Data;
 
 namespace WikiPeopleCounter.Models;
 
@@ -32,11 +33,17 @@ public class Page {
     
     public string WikiPageId { get; set; }
     
+    public string SortKey { get; set; }
+    
     public string Title { get; set; }
     
     public string Name { get; set; }
     
-    public bool Processed { get; set; } = false;
+    public uint PulledFromId { get; set; }
+    
+    [NotMapped]
+    public bool Processed => this.Translations.HasValue && this.WordCount.HasValue && string.IsNullOrEmpty(this.Url) &&
+               this.Views.HasValue && this.Backlinks.HasValue && this.LastUpdated.HasValue;
     
     public int? Translations { get; set; }
         
@@ -51,6 +58,10 @@ public class Page {
     public DateTime? LastUpdated { get; set; }
     
     public ProcessedPage ToProcessed => new (this);
+    
+    [InverseProperty(nameof(Category.Pages))] 
+    [ForeignKey(nameof(PulledFromId))]
+    public Category PulledFrom { get; set; } = null!;
 }
 
 [NotMapped]
@@ -89,6 +100,8 @@ public class ProcessedPage {
     
     public string WikiPageId => source.WikiPageId;
     
+    public string SortKey => source.SortKey;
+    
     public string Name => source.Name;
     
     public string Url => source.Url ?? throw new UnreachableException("source should have been validated.");
@@ -103,4 +116,6 @@ public class ProcessedPage {
     
     public DateTime LastUpdated =>
         source.LastUpdated ?? throw new UnreachableException("source should have been validated.");
+    
+    public Category PulledFrom => source.PulledFrom;
 }

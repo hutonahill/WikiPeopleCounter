@@ -27,7 +27,7 @@ namespace WikiPeopleCounter.Data;
 
 public class PageDataContext : DbContext {
     public DbSet<Page> Pages { get; set; }
-    public DbSet<CategoriesSearched> CategoriesSearched { get; set; }
+    public DbSet<Category> Categories { get; set; }
     
     protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder) {
         // Build the path to store the SQLite DB in the same folder as the executable
@@ -57,7 +57,7 @@ public class PageDataContext : DbContext {
                .IsUnique();
         });
         
-        modelBuilder.Entity<CategoriesSearched>(entity => {
+        modelBuilder.Entity<Category>(entity => {
             entity.HasKey(e => e.CategoryId);
             
             entity.Property(e => e.Title)
