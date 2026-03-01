@@ -31,20 +31,6 @@ class Program {
             
             await FetchCategoryPagesAsync(category, lastSortKey);
         }
-        
-        /*int count = -1;
-        using (PageDataContext ctx = new ()) {
-            count = ctx.Pages.Count(p => !p.Processed);
-        }
-        
-        _bar = new ProgressBar(count, "Processing pages");
-        
-        bool running = true;
-        while (running) {
-            running = await ProcessPageBatchAsync(TimeSpan.FromDays(30));
-        }
-        
-        _bar.Dispose();*/
     }
     
     private static readonly IReadOnlyDictionary<string, bool> _translator = new Dictionary<string, bool> {
@@ -78,19 +64,22 @@ class Program {
     }
     
     private static void SetUp() {
-        using var context = new PageDataContext();
+        using PageDataContext context = new PageDataContext();
+        
         // Ensure database and tables exist
         context.Database.EnsureCreated();
         
-        foreach (string catigory in CategoriesToSearch) {
-            if (!context.Categories.Any(c => c.Title == catigory)) {
-                context.Categories.Add(new Category(catigory));
+        // Ensure all target categories exist in the DB
+        foreach (string category in CategoriesToSearch) {
+            if (!context.Categories.Any(c => c.Title == category)) {
+                context.Categories.Add(new Category(category));
             }
         }
         
+        context.SaveChanges();
+        
         int totalPages = context.Pages.Count();
-        int processedPages = context.Pages.Count(p => p.Processed);
-        int searchedCatigoryCount = context.Categories.Count(c => c.Finished);
+        int searchedCategoryCount = context.Categories.Count(c => c.Finished);
         
         if (totalPages == 0) {
             Console.WriteLine("Database is empty. Ready to start fetching pages.");
@@ -100,33 +89,24 @@ class Program {
             // DB is not empty
             if (Question("Database contains pages. Do you want to wipe all pages?")) {
                 context.Pages.RemoveRange(context.Pages);
+                context.Categories.ToList().ForEach(c => c.Finished = false); // reset category status
                 context.SaveChanges();
+                
                 Console.WriteLine("Database wiped. Ready to start fresh.");
-                _categoriesToSearch = CategoriesToSearch;
-                context.Categories.ForEachAsync(c => c.Finished = false);
+                _categoriesToSearch = CategoriesToSearch.ToList();
             }
             else {
-                if (processedPages == 0) {
-                    Console.WriteLine("Database has pages, but none have been processed.");
-                    
-                    if (Question("Do you want to search for more pages?")) {
-                        if (searchedCatigoryCount > 0 && Question("Some categories have already been fully searched. Do you want to re-search them?")) {
-                            _categoriesToSearch = context.Categories.Select(c => c.Title).ToList();
-                        }
-                        else {
-                            _categoriesToSearch = context.Categories
-                               .Where(c => c.Finished == false)
-                               .Select(c => c.Title)
-                               .ToList();
-                        }
-                    }
-                    else {
-                        Console.WriteLine("No new pages will be fetched. Continuing with existing pages.");
-                    }
+                if (searchedCategoryCount > 0 && Question("Some categories have already been fully fetched. Do you want to re-fetch them?")) {
+                    _categoriesToSearch = context.Categories.Select(c => c.Title).ToList();
                 }
                 else {
-                    Console.WriteLine($"Database has processed {processedPages:N0}/{totalPages:N0} pages. Continuing processing.");
+                    _categoriesToSearch = context.Categories
+                       .Where(c => !c.Finished)
+                       .Select(c => c.Title)
+                       .ToList();
                 }
+                
+                Console.WriteLine($"Database has {totalPages:N0} pages. {_categoriesToSearch.Count:N0} categories will be fetched.");
             }
         }
     }
@@ -252,251 +232,6 @@ class Program {
         }
 
         return true;
-    }
-    
-    private static async Task<Dictionary<string, int>> GetPageViewsBatchAsync(
-        HttpClient client,
-        IEnumerable<string> titles,
-        TimeSpan pageviewsPeriod,
-        int delayMilliseconds) // optional parent bar
-    {
-        DateTime endDate = DateTime.Now.Date;
-        DateTime startDate = endDate - pageviewsPeriod;
-        Dictionary<string, int> results = new();
-
-        ProgressBarOptions options = new() { ForegroundColor = ConsoleColor.Cyan };
-        
-        IEnumerable<string> enumerable = titles.ToList();
-        
-        // If parent bar is passed, create a child; else just create a new top-level bar
-        Debug.Assert(_bar != null, nameof(_bar) + " != null");
-        IProgressBar childBar = _bar.Spawn(enumerable.Count(), "Fetching pageviews...", options);
-        
-        foreach (string title in enumerable) {
-            string encodedTitle = Uri.EscapeDataString(title.Replace(" ", "_"));
-
-            string url = $"https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/en.wikipedia.org/all-access/user/{encodedTitle}/daily/{startDate:yyyyMMdd}/{endDate:yyyyMMdd}";
-
-            TimeSpan remainingDelay = (_lastQueryTime + TimeSpan.FromMilliseconds(delayMilliseconds)) - DateTime.Now;
-            if (remainingDelay > TimeSpan.Zero) await Task.Delay(remainingDelay);
-
-            int totalViews = 0;
-            try {
-                HttpResponseMessage response = await client.GetAsync(url);
-                _lastQueryTime = DateTime.Now;
-
-                if (response.IsSuccessStatusCode) {
-                    string raw = await response.Content.ReadAsStringAsync();
-                    using JsonDocument doc = JsonDocument.Parse(raw);
-
-                    if (doc.RootElement.TryGetProperty("items", out JsonElement items)) {
-                        foreach (JsonElement item in items.EnumerateArray()) {
-                            totalViews += item.GetProperty("views").GetInt32();
-                        }
-                    }
-                }
-            }
-            catch (Exception ex) {
-                Console.WriteLine($"Error fetching pageviews for '{title}': {ex.Message}");
-            }
-
-            results[title] = totalViews;
-            childBar.Tick($"Got view count for '{title}'"); // update child/sub bar
-        }
-        
-        childBar.Dispose();
-        return results;
-    }
-
-    private static async Task<Dictionary<string, int>> GetBacklinksBatchAsync(List<string> titles) {
-        Dictionary<string, int> results = new ();
-        string lhContinue = string.Empty;
-
-        // Initialize counts
-        foreach (string title in titles) {
-            results[title] = 0;
-        }
-
-        string joinedTitles = string.Join("|", titles.Select(t => t.Replace(" ", "_")));
-
-        do {
-            Dictionary<string, string> parameters = new () {
-                { "action", "query" },
-                { "prop", "linkshere" },
-                { "titles", joinedTitles },
-                { "lhlimit", "max" }
-            };
-
-            if (!string.IsNullOrEmpty(lhContinue)) {
-                parameters["lhcontinue"] = lhContinue;
-            }
-            
-            using JsonDocument doc = await QueryWikipediaApiAsync(parameters);
-            
-            if (doc.RootElement.TryGetProperty("query", out JsonElement queryEl) &&
-                queryEl.TryGetProperty("pages", out JsonElement pages)) {
-                foreach (JsonProperty pageProp in pages.EnumerateObject()) {
-                    JsonElement page = pageProp.Value;
-                    
-                    if (page.TryGetProperty("title", out JsonElement titleEl) &&
-                        page.TryGetProperty("linkshere", out JsonElement links)) {
-                        string pageTitle = titleEl.GetString() ?? string.Empty;
-                        results[pageTitle] += links.GetArrayLength();
-                    }
-                }
-            }
-            
-            if (doc.RootElement.TryGetProperty("continue", out JsonElement cont) &&
-                cont.TryGetProperty("lhcontinue", out JsonElement contVal)) {
-                lhContinue = contVal.GetString() ?? string.Empty;
-            }
-            else {
-                lhContinue = string.Empty;
-            }
-            
-
-        } while (!string.IsNullOrEmpty(lhContinue));
-
-        return results;
-    }
-
-    private static async Task<Dictionary<string, (string? Url, int? Length, int? Translations)>> GetPageInfoBatchAsync(
-        List<string> titles
-    ) {
-        Dictionary<string, (string? Url, int? Length, int? Translations)> results = new ();
-
-        foreach (string title in titles) {
-            results[title] = (null, null, 0);
-        }
-
-        string llContinue = string.Empty;
-        string joinedTitles = string.Join("|", titles.Select(t => t.Replace(" ", "_")));
-
-        do {
-            Dictionary<string, string> parameters = new () {
-                { "action", "query" },
-                { "format", "json" },
-                { "titles", joinedTitles },
-                { "prop", "info|langlinks" },
-                { "inprop", "url" },
-                { "lllimit", "max" }
-            };
-
-            if (!string.IsNullOrEmpty(llContinue)) {
-                parameters["llcontinue"] = llContinue;
-            }
-
-            using JsonDocument doc = await QueryWikipediaApiAsync(parameters);
-
-            if (doc.RootElement.TryGetProperty("query", out JsonElement queryEl) &&
-                queryEl.TryGetProperty("pages", out JsonElement pagesEl))
-            {
-                foreach (JsonProperty pageProp in pagesEl.EnumerateObject()) {
-                    JsonElement page = pageProp.Value;
-
-                    string pageTitle =
-                        page.TryGetProperty("title", out JsonElement titleProp)
-                            ? titleProp.GetString() ?? string.Empty
-                            : string.Empty;
-
-                    string? fullUrl =
-                        page.TryGetProperty("fullurl", out JsonElement urlProp)
-                            ? urlProp.GetString()
-                            : null;
-
-                    int? length =
-                        page.TryGetProperty("length", out JsonElement lenProp)
-                            ? lenProp.GetInt32()
-                            : null;
-
-                    int translationsToAdd = 0;
-
-                    if (page.TryGetProperty("langlinks", out JsonElement langProp)) {
-                        translationsToAdd = langProp.GetArrayLength();
-                    }
-
-                    if (results.ContainsKey(pageTitle)) {
-                        (string? existingUrl, int? existingLength, int? existingTranslations) =
-                            results[pageTitle];
-
-                        int totalTranslations =
-                            (existingTranslations ?? 0) + translationsToAdd;
-
-                        results[pageTitle] =
-                            (fullUrl ?? existingUrl, length ?? existingLength, totalTranslations);
-                    }
-                }
-            }
-
-            if (doc.RootElement.TryGetProperty("continue", out JsonElement cont) &&
-                cont.TryGetProperty("llcontinue", out JsonElement contVal))
-            {
-                llContinue = contVal.GetString() ?? string.Empty;
-            }
-            else {
-                llContinue = string.Empty;
-            }
-            
-            
-
-        } while (!string.IsNullOrEmpty(llContinue));
-
-        return results;
-    }
-
-    private static async Task<bool> ProcessPageBatchAsync(
-        TimeSpan pageviewsPeriod,
-        int batchSize = 500,
-        int delayMilliseconds = 500)
-    {
-
-        await using PageDataContext context = new();
-
-        List<Page> pagesToProcess = await context.Pages
-            .Where(p => !p.Processed)
-            .OrderBy(p => p.PageId)
-            .Take(batchSize)
-            .ToListAsync();
-
-        if (pagesToProcess.Count == 0) {
-            return false;
-        }
-        
-        List<string> titleList = pagesToProcess
-           .Select(p => p.Title)
-           .ToList();
-        
-        //Dictionary<string, int> pageViews = await GetPageViewsBatchAsync(client, titleList, pageviewsPeriod, delayMilliseconds);
-        Dictionary<string, int> backlinks = await GetBacklinksBatchAsync(titleList);
-        Dictionary<string, (string? Url, int? Length, int? Translations)> pageInfo = 
-            await GetPageInfoBatchAsync(titleList);
-
-        foreach (Page page in pagesToProcess) {
-            //page.Views = pageViews[page.Title];
-            
-            page.Backlinks = backlinks[page.Title];
-            
-            (string? url, int? length, int? translations) = pageInfo[page.Title];
-
-            if (url != null) {
-                page.Url = url;
-            }
-
-            if (length.HasValue) {
-                page.WordCount = length.Value;
-            }
-
-            if (translations.HasValue) {
-                page.Translations = translations.Value;
-            }
-            
-            page.LastUpdated = DateTime.Now;
-            
-            await context.SaveChangesAsync();
-            _bar?.Tick($"Processed '{page.Title}'");
-        }
-
-        return await context.Pages.AnyAsync(p => !p.Processed);
     }
     
     private static readonly HttpClient _client = new ();
